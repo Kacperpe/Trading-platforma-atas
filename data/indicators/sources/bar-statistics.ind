@@ -1,0 +1,51 @@
+language(1)
+indicator("Bar Statistics", id = "core.bar-statistics", sourceable = false, max_bars_back = 1)
+display(view = "table")
+reset = input.string("Daily", "Reset cumulative delta", options = ["Daily", "Never"])
+
+// Prefer real trade aggregates; fall back to the exchange's candle directional volume.
+has_trades = chart.trade.available
+has_candle_side = chart.directional_volume_available
+buy = select(has_trades, chart.trade.buy_qty, select(has_candle_side, chart.buy_qty, na))
+sell = select(has_trades, chart.trade.sell_qty, select(has_candle_side, chart.sell_qty, na))
+total = buy + sell
+delta = buy - sell
+delta_pct = select(total == 0, 0, delta / total * 100)
+trades = select(has_trades, chart.trade.count, na)
+avg_trade = select(trades > 0, total / trades, na)
+
+// Session cumulative delta, reset at UTC midnight unless disabled.
+// An equally weighted daily-anchored average of bar_index equals
+// (first index of the day + current index) / 2, which yields the session start.
+mean_index = ta.avwap(bar_index, 1, "Day")
+session_start = 2 * mean_index - bar_index
+new_session = reset == "Daily" && math.abs(session_start - session_start[1]) > 0.5
+var session_delta = 0.0
+if new_session {
+    session_delta := 0.0
+}
+if !na(delta) {
+    session_delta := session_delta + delta
+}
+cum_delta = select(na(delta) && session_delta == 0, na, session_delta)
+
+plot(delta, id = "value", title = "Delta", precision = "instrument", color_slot = "main", overlay = false, layer = false)
+plot(chart.volume, id = "bar_stats.volume", title = "Volume", precision = "instrument", overlay = false, layer = false)
+plot(trades, id = "bar_stats.trades", title = "Trades", precision = "instrument", overlay = false, layer = false)
+plot(avg_trade, id = "bar_stats.avg_trade", title = "Avg trade", precision = "instrument", overlay = false, layer = false)
+plot(buy, id = "bar_stats.buy", title = "Buy", precision = "instrument", color_slot = "positive", overlay = false, layer = false)
+plot(sell, id = "bar_stats.sell", title = "Sell", precision = "instrument", color_slot = "negative", overlay = false, layer = false)
+plot(delta_pct, id = "bar_stats.delta_pct", title = "Delta %", precision = "instrument", overlay = false, layer = false)
+plot(cum_delta, id = "bar_stats.cum_delta", title = "Session delta", precision = "instrument", overlay = false, layer = false)
+
+style("positive", title = "Positive values", role = "success")
+style("negative", title = "Negative values", role = "danger")
+style("main", title = "Neutral values")
+column(title = "Volume", source = "bar_stats.volume", color_slot = "main")
+column(title = "Trades", source = "bar_stats.trades", format = "integer", color_slot = "main")
+column(title = "Avg trade", source = "bar_stats.avg_trade", color_slot = "main")
+column(title = "Buy", source = "bar_stats.buy", color_slot = "positive")
+column(title = "Sell", source = "bar_stats.sell", color_slot = "negative")
+column(title = "Delta", source = "value", color_mode = "signed", positive_color_slot = "positive", negative_color_slot = "negative")
+column(title = "Delta%", source = "bar_stats.delta_pct", format = "percent", color_mode = "signed", positive_color_slot = "positive", negative_color_slot = "negative")
+column(title = "Session Δ", source = "bar_stats.cum_delta", color_mode = "signed", positive_color_slot = "positive", negative_color_slot = "negative")

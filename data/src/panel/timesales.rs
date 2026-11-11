@@ -146,7 +146,6 @@ impl SmartTape {
     pub const MAX_WINDOW_MS: u32 = 1_000;
 }
 
-
 #[derive(Clone, Copy)]
 pub struct TapeTrade {
     trade: Trade,

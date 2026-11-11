@@ -7,7 +7,9 @@ use crate::{
     },
 };
 use data::layout::pane::VisualConfig;
-use data::panel::timesales::{self, StackedBar, StackedBarRatio, TickerDisplay, TimeFormat};
+use data::panel::timesales::{
+    self, SmartTape, StackedBar, StackedBarRatio, TickerDisplay, TimeFormat,
+};
 use data::util::format_with_commas;
 use iced::{
     Alignment, Element, Length,
@@ -176,7 +178,63 @@ pub fn timesales_cfg_view<'a>(cfg: timesales::Config) -> InspectorContent<'a, Me
         inner.into()
     };
 
+    let smart_tape: Element<_> = {
+        let enable_checkbox = checkbox(cfg.smart_tape.is_some())
+            .label("Merge prints of one aggressive order")
+            .on_toggle(move |value| Message::VisualConfigChanged {
+                config: VisualConfig::TimeAndSales(timesales::Config {
+                    smart_tape: value.then(SmartTape::default),
+                    ..cfg
+                }),
+                sync_all: false,
+            });
+
+        let mut inner = column![enable_checkbox].width(Length::Fill).spacing(8);
+
+        if let Some(settings) = cfg.smart_tape {
+            inner = inner.push(classic_slider_row(
+                Some(text("Time window")),
+                0.0..=SmartTape::MAX_WINDOW_MS as f32,
+                settings.window_ms as f32,
+                move |value| Message::VisualConfigChanged {
+                    config: VisualConfig::TimeAndSales(timesales::Config {
+                        smart_tape: Some(SmartTape {
+                            window_ms: value.round() as u32,
+                        }),
+                        ..cfg
+                    }),
+                    sync_all: false,
+                },
+                |value| {
+                    if *value < 1.0 {
+                        "same timestamp".to_string()
+                    } else {
+                        format!("{} ms", value.round() as u32)
+                    }
+                },
+                Some(10.0),
+            ));
+        }
+
+        inner.into()
+    };
+
+    let smart_tape_title = row![
+        crate::widget::text::section("Smart Tape"),
+        tooltip(
+            button("i").style(style::button::info),
+            Some(
+                "Consecutive prints with the same side and ticker are merged into one row \
+                 (size summed, ×N = number of fills). The size filter applies to the merged size."
+            ),
+            TooltipPosition::Left,
+        )
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
     let mut content = InspectorContent::new(vec![
+        InspectorSection::new(smart_tape_title, smart_tape).with_modal_container(),
         InspectorSection::titled("Stacked bar", stacked_bar).with_modal_container(),
         InspectorSection::titled("Ticker display", ticker_display).with_modal_container(),
         InspectorSection::titled("Time format", time_format).with_modal_container(),

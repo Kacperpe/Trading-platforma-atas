@@ -3,7 +3,8 @@ use data::config::theme::{darken, lighten};
 use data::config::timezone::TimeLabelKind;
 pub use data::panel::timesales::Config;
 use data::panel::timesales::{
-    HistAgg, HistAggValues, StackedBar, TapeTrade, TickerDisplay, TimeFormat, prune_trades,
+    HistAgg, HistAggValues, SmartTape, StackedBar, TapeTrade, TickerDisplay, TimeFormat,
+    prune_trades,
 };
 use data::tickers_table::market_suffix;
 use exchange::unit::Qty;
@@ -98,6 +99,8 @@ impl TimeAndSales {
 pub struct TimeAndSales {
     recent_trades: VecDeque<TapeTrade>,
     paused_trades_buffer: VecDeque<TapeTrade>,
+    /// Smart Tape rows derived from `recent_trades`; empty when Smart Tape is off.
+    smart_rows: VecDeque<TapeTrade>,
     hist_agg: HistAgg,
     is_paused: bool,
     max_filtered_qty: Qty,
@@ -113,6 +116,7 @@ impl TimeAndSales {
         Self {
             recent_trades: VecDeque::new(),
             paused_trades_buffer: VecDeque::new(),
+            smart_rows: VecDeque::new(),
             hist_agg: HistAgg::default(),
             is_paused: false,
             config: config.unwrap_or_default(),
@@ -133,13 +137,40 @@ impl TimeAndSales {
             TapeTrade::merge_into(&mut self.paused_trades_buffer, incoming);
         } else {
             for entry in &incoming {
-                let quantity = entry.quantity(self.multiple_tickers);
-                self.hist_agg.add(entry.is_sell, quantity);
-                if entry.passes_filter(self.config.trade_size_filter) {
-                    self.max_filtered_qty = self.max_filtered_qty.max(quantity);
+                self.hist_agg
+                    .add(entry.is_sell, entry.quantity(self.multiple_tickers));
+            }
+
+            match self.config.smart_tape {
+                None => {
+                    for entry in &incoming {
+                        self.track_max_qty(entry);
+                    }
+                    TapeTrade::merge_into(&mut self.recent_trades, incoming);
+                }
+                Some(settings) => {
+                    let in_order = incoming.iter().all(|entry| {
+                        self.recent_trades
+                            .back()
+                            .is_none_or(|last| last.time <= entry.time)
+                    }) && incoming.is_sorted_by_key(|entry| entry.time);
+
+                    if in_order {
+                        let first_touched = self.smart_rows.len().saturating_sub(1);
+                        for entry in &incoming {
+                            TapeTrade::coalesce_into(&mut self.smart_rows, *entry, settings);
+                        }
+                        TapeTrade::merge_into(&mut self.recent_trades, incoming);
+                        for index in first_touched..self.smart_rows.len() {
+                            let row = self.smart_rows[index];
+                            self.track_max_qty(&row);
+                        }
+                    } else {
+                        TapeTrade::merge_into(&mut self.recent_trades, incoming);
+                        self.rebuild_metrics();
+                    }
                 }
             }
-            TapeTrade::merge_into(&mut self.recent_trades, incoming);
             self.prune_by_time();
         }
         self.prune_paused_by_time();
@@ -154,17 +185,48 @@ impl TimeAndSales {
     fn rebuild_metrics(&mut self) {
         self.hist_agg = HistAgg::default();
         self.max_filtered_qty = Qty::ZERO;
-        let mut visible_trades = 0;
         for entry in &self.recent_trades {
-            let quantity = entry.quantity(self.multiple_tickers);
-            self.hist_agg.add(entry.is_sell, quantity);
+            self.hist_agg
+                .add(entry.is_sell, entry.quantity(self.multiple_tickers));
+        }
+
+        self.smart_rows = match self.config.smart_tape {
+            Some(settings) => TapeTrade::build_smart_rows(&self.recent_trades, settings),
+            None => VecDeque::new(),
+        };
+
+        let mut visible_trades = 0;
+        let mut max_qty = Qty::ZERO;
+        for entry in self.display_rows() {
             if entry.passes_filter(self.config.trade_size_filter) {
                 visible_trades += 1;
-                self.max_filtered_qty = self.max_filtered_qty.max(quantity);
+                max_qty = max_qty.max(entry.quantity(self.multiple_tickers));
             }
         }
+        self.max_filtered_qty = max_qty;
         self.clamp_scroll(visible_trades);
         self.cache.clear();
+    }
+
+    /// Rows shown in the feed: merged Smart Tape rows or the raw tape.
+    fn display_rows(&self) -> &VecDeque<TapeTrade> {
+        if self.config.smart_tape.is_some() {
+            &self.smart_rows
+        } else {
+            &self.recent_trades
+        }
+    }
+
+    fn track_max_qty(&mut self, entry: &TapeTrade) {
+        if entry.passes_filter(self.config.trade_size_filter) {
+            self.max_filtered_qty = self
+                .max_filtered_qty
+                .max(entry.quantity(self.multiple_tickers));
+        }
+    }
+
+    pub fn smart_tape(&self) -> Option<SmartTape> {
+        self.config.smart_tape
     }
 
     fn clamp_scroll_to_filter(&mut self) {
@@ -176,7 +238,7 @@ impl TimeAndSales {
             / TRADE_ROW_HEIGHT)
             .ceil() as usize;
         let visible_trades = self
-            .recent_trades
+            .display_rows()
             .iter()
             .rev()
             .filter(|entry| entry.passes_filter(self.config.trade_size_filter))
@@ -209,7 +271,8 @@ impl TimeAndSales {
     }
 
     pub fn set_config(&mut self, config: Config) {
-        let filter_changed = self.config.trade_size_filter != config.trade_size_filter;
+        let filter_changed = self.config.trade_size_filter != config.trade_size_filter
+            || self.config.smart_tape != config.smart_tape;
         let previous_height = self.stacked_bar_height();
         self.config = config;
         let height_changed = self.stacked_bar_height() != previous_height;
@@ -459,6 +522,7 @@ impl canvas::Program<Message> for TimeAndSalesView<'_> {
                 row_width,
                 self.panel.config.ticker_display,
                 self.panel.config.time_format,
+                self.panel.config.smart_tape.is_some(),
             );
             let show_ticker = self.panel.config.ticker_display == TickerDisplay::IconAndTicker;
             let icon_column = if show_ticker {
@@ -495,7 +559,7 @@ impl canvas::Program<Message> for TimeAndSalesView<'_> {
 
             let trades_to_draw = self
                 .panel
-                .recent_trades
+                .display_rows()
                 .iter()
                 .filter(|entry| entry.passes_filter(self.panel.config.trade_size_filter))
                 .rev()
@@ -718,6 +782,7 @@ fn trade_column_bounds(
     width: f32,
     display: TickerDisplay,
     time_format: TimeFormat,
+    smart_tape: bool,
 ) -> [(f32, f32); 4] {
     let time_chars = match time_format {
         TimeFormat::MinutesSecondsMillis => 9,
@@ -734,7 +799,8 @@ fn trade_column_bounds(
     let widths = [
         source_width,
         (12.0 * CHAR_WIDTH).ceil(),
-        (9.0 * CHAR_WIDTH).ceil(),
+        // Smart Tape appends the fill count ("1.2K ×14").
+        (if smart_tape { 14.0 } else { 9.0 } * CHAR_WIDTH).ceil(),
     ];
 
     let time_width = (time_chars as f32 * CHAR_WIDTH).ceil();
